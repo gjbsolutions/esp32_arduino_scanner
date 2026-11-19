@@ -14,6 +14,7 @@ It is a port of the C3 capture path of [ESPARGOS/esp-sdr](https://github.com/ESP
 - **Hardware AGC** or a **manual gain index**.
 - A power **scan** across a frequency range.
 - Boot-time safety checks that refuse to capture if the sketch cannot do so safely.
+- A **browser scanner** (Web Serial) with a live spectrum, waterfall and settings panel, plus a small JavaScript driver you can reuse in your own web app. See [Web scanner](#web-scanner).
 
 ## How it works
 
@@ -48,6 +49,8 @@ Keep all three files together in a folder named `c3_iq`.
 | `c3_iq.ino` | Thin wrapper containing `setup()` and `loop()`. |
 | `c3_iq_core.cpp` | All the real code: tuning, gain, bandwidth, capture, command interface. |
 | `rf_guard.c` | Reserves the SRAM block from the heap (see [How it works](#how-it-works)). |
+
+The web scanner files are separate and do not go in the sketch folder. See [Web scanner](#web-scanner).
 
 The code lives in a `.cpp` file on purpose. When everything was in the `.ino`, the Arduino IDE's automatic prototype generation corrupted the linkage of `setup()` and `loop()` and the link failed with `undefined reference to setup()`. A `.cpp` file is not touched by that step.
 
@@ -108,6 +111,81 @@ The gain index range is only known after the receiver has been tuned, so run `F`
 
 Edit `blockStats()` or add your own function in `c3_iq_core.cpp`. After a successful `sdrCapture(n, rate)`, the samples are in the reserved block, read through `IQ_BUF[k]`. Decode them with `unpack(word, i, q, gain)`, which returns standard-sign I and Q. Do any heavy processing outside the capture call: while the engine is running the CPU cannot touch the block, and interrupts are masked for the duration of the capture.
 
+## Web scanner
+
+`web/` contains a browser front end for the sketch. It needs **no firmware changes**: it opens the serial port with the Web Serial API, sends the commands from [Commands](#commands) and parses the text readings the sketch already prints.
+
+| File | Purpose |
+|---|---|
+| `web/c3iq.js` | JavaScript driver: connection, command queue, parsing, sweeps, and a built-in demo board. A classic script (no modules, no build step). |
+| `web/scanner.html` | The scanner interface, built on `c3iq.js`. |
+
+Keep both files in the same folder, for example `web/`, separate from the `c3_iq` sketch folder.
+
+### Run it
+
+1. Flash the sketch as described in [Build and run](#build-and-run).
+2. Close the Arduino Serial Monitor (only one program can hold the port).
+3. Open `web/scanner.html` in **Chrome or Edge**. Web Serial is not available in Firefox or Safari. Opening the file directly works; if your browser refuses, serve the folder with `python3 -m http.server` and open `http://localhost:8000/scanner.html`.
+4. Click **Connect (USB)** and pick the board's port. Opening the port can reset the board, so the page waits up to 3 s for the boot banner.
+
+Click **Demo** instead to try the interface with a simulated board and no hardware.
+
+### Interface
+
+- **Receiver:** frequency, bandwidth (0 = automatic), sample rate (80, 40 or 16 MS/s), samples per capture, and hardware AGC or a manual gain index. The manual gain limit is read from the board with `G ?` after tuning. **Apply settings** sends them in order: `F`, `B`, `R`, `N`, `G`.
+- **Sweep tab:** runs the `S` command repeatedly and plots power in dBFS against frequency, with optional peak hold, Wi-Fi channel markers, a waterfall (newest sweep on top) and a hover readout. Presets cover the 2.4 GHz band, 2.2-2.7 GHz and 1.85-2.2 GHz. **Sweep once** runs a single pass.
+- **Monitor tab:** plots the level at the tuned frequency over time, with cards for RMS, peak, DC I/Q and the gain index.
+- **Device log:** every raw line from the board.
+
+The sweep panel warns when the range goes outside roughly 1.84-2.7 GHz, where the PLL may not lock (see [Limitations](#limitations)).
+
+### Using the driver in your own page
+
+```html
+<script src="c3iq.js"></script>
+<script>
+  async function go() {
+    const dev = await C3IQ.connectSerial();   // must be called from a click handler
+    dev.on('reading', e => console.log(e.detail));
+    await dev.tune(2437);
+    await dev.bandwidth(20);
+    await dev.sampleRate(16);
+    await dev.samples(4096);
+    await dev.gain('auto');                   // or a manual index, e.g. dev.gain(40)
+    const pts = await dev.scan(2400, 2500, 1);
+    console.log(pts);
+  }
+</script>
+```
+
+| Call | Sends | Notes |
+|---|---|---|
+| `C3IQ.connectSerial(baud = 115200)` | | Opens the port picker. Resolves after the boot banner (or 3 s). |
+| `C3IQ.connectDemo()` | | Simulated board, same API. |
+| `dev.tune(mhz)` | `F` | 100-6000. |
+| `dev.bandwidth(mhz)` | `B` | 14-62, or 0 for automatic. |
+| `dev.sampleRate(msps)` | `R` | 80, 40 or 16. |
+| `dev.samples(n)` | `N` | 1-16380. |
+| `dev.gain('auto' \| index)` | `G H` / `G <index>` | |
+| `dev.gainInfo()` | `G ?` | `{mode, index, max, latched}`. Tune first; `max` is only known then. |
+| `dev.scan(from, to, step)` | `S` | Resolves with one reading per step (1024 samples each). |
+| `dev.close()` | | Closes the port. |
+
+Arguments are range-checked before anything is sent, and a firmware `ERR ...` reply rejects the promise. Commands are queued, so they can be issued back to back.
+
+Events (`dev.on(name, fn)`, payload in `e.detail`): `reading` (streaming reading at the tuned frequency), `scanpoint` (each point during a sweep), `line` (raw text), `ready`, and `close`.
+
+A reading looks like `{ mhz, rms, dbfs, dcI, dcQ, peak, gainMode, gain, failed, t }`. `failed: true` (with only `mhz` and `t`) marks a `capture failed` line. `C3IQ.parseReading(line)` is exposed for your own use.
+
+### Web scanner notes
+
+- **Text protocol.** The driver parses the sketch's `report()` output. If you change that print format, update the regular expression at the top of `c3iq.js`.
+- **Power only.** You get RMS, peak, DC and gain per capture, not raw samples. Sending raw I/Q to the browser would need a firmware change (a binary dump command and a faster baud rate): a full 16,380-word capture is about 65 KB, which takes several seconds at 115200 baud.
+- **Streaming and sweeps share the port.** While a sweep runs, the driver matches incoming lines to the expected frequencies in order. A streaming line from just before the sweep could, rarely, be mistaken for the first point if it is at the same frequency.
+- **dBFS is not calibrated.** Levels are relative to ADC full scale at whatever gain the AGC (or your manual index) chose. Gain indexes are not dB, so levels are not comparable across gain settings.
+- **Untested.** The web scanner has not yet been run against real hardware by the author. Please report results.
+
 ## Boot-time safety checks and troubleshooting
 
 The capture hands a block of SRAM to the modem. If anything the CPU needs lives there, the board crashes. So the sketch checks before it ever captures:
@@ -128,12 +206,15 @@ Verified by the author on a plain ESP32-C3 with Arduino-ESP32 3.3.10: build, upl
 
 Not yet independently verified: manual gain latching when the register fallback is used, tuning to frequencies that are not Wi-Fi channels, the bandwidth setting, and the `S` scan across a busy channel. Please report results.
 
+The [web scanner](#web-scanner) has not yet been verified on hardware.
+
 ## Limitations
 
 - **Snapshots, not a stream.** Each capture is a short burst (at most 16,380 samples). Between captures you see nothing, so Wi-Fi traffic shows up as bursts. Use longer captures (`R 16`, `N 16380`) to catch whole packets.
 - **No per-frequency DC recalibration.** The full firmware recalibrates the receiver at each frequency using private PHY internals and linker `--wrap` flags, which the Arduino IDE cannot easily add. Expect a larger DC offset away from 2412 MHz. Subtract the mean for spectral work.
 - **Frequency range.** Tuning goes through the PHY. Direct locking is realistic roughly between 2.2 and 2.7 GHz, plus 1842–2209 MHz through the alternate oscillator path. Outside that, `F` is accepted but the PLL may not lock.
 - **Manual gain.** The Arduino core does not link the RF-test library that provides `force_rx_gain`, so the sketch references it weakly. If the real function is not available it writes the forced-gain register field directly, and prints `gain: register fallback (unverified)` at boot. The firmware this is based on also verifies the analog gain words by read-back; this sketch only checks the forced-index field. Always confirm that stepping the index changes the signal level.
+- **Web Serial browsers only.** The web scanner needs Chrome or Edge, and the port must not be open in another program.
 - **Receive only.** The radio never transmits, but regulations on reception and use of captured data vary by country. You are responsible for complying with local law.
 - **Undocumented hardware.** The mechanism comes from reverse engineering. Behavior may differ between chip revisions and between Arduino-ESP32 versions.
 
@@ -141,7 +222,7 @@ Not yet independently verified: manual gain latching when the register fallback 
 
 This project is derived from [ESPARGOS/esp-sdr](https://github.com/ESPARGOS/esp-sdr) (register sequences, tuning order, local-oscillator plan, bandwidth curve and memory layout follow its ESP32-C3 target). ESP-SDR is licensed under **GPL-3.0**, so this derivative is released under **GPL-3.0** too. See `LICENSE`.
 
-Parts of this code were written with AI assistance (Claude) and validated on hardware only as described under [Status](#status).
+Parts of this code, including the web scanner, were written with AI assistance (Claude) and validated on hardware only as described under [Status](#status).
 
 This is an independent project and is not affiliated with ESPARGOS.
 
