@@ -24,6 +24,10 @@
  *   G ?                  show gain mode and the highest valid index
  *   N <samples>          samples per capture (1..16380)
  *   S <from> <to> <step> power scan across frequencies
+ *   D <samples>          send one capture as a binary I/Q frame (web FFT); no trailing OK
+ *   M <0|1>              pause/resume the periodic text readings
+ *   T <size> <avg> [dc]  on-board FFT: size 64..FFT_MAX (power of 2), avg 1..32, dc 1 = remove DC;
+ *                        replies with one binary spectrum frame (see sendSpectrum)
  */
 #include <Arduino.h>
 #include <WiFi.h>
@@ -105,6 +109,7 @@ static bool heapAvoidsDumpBlock() {
 #define DUMP_LANE    0x60033d90u
 #define MARKER       0xa5a0055au
 #define MAX_WORDS    16380u
+#define FFT_MAX      2048             // largest on-board FFT (power of 2, <= 4096); about 14 bytes of heap per bin
 
 static portMUX_TYPE capMux = portMUX_INITIALIZER_UNLOCKED;
 static bool sdrSafe = false;
@@ -275,8 +280,116 @@ static void report(unsigned mhz, uint32_t n) {
                 gainManual ? "manual " : "agc ", s.gain);
 }
 
+static bool streaming = true;
+
+// Binary frame: 12-byte header { 0x00, 0xA5, 'I', 'Q', u32 n, u16 rateMsps, u16 MHz } (little endian),
+// then n raw 32-bit sample words exactly as unpack() expects. Text never contains 0x00.
+static void sendIq(uint32_t n) {
+  uint8_t h[12] = { 0, 0xA5, 'I', 'Q' };
+  uint16_t r = (uint16_t)rateMsps, f = (uint16_t)curMHz;
+  memcpy(h + 4, &n, 4); memcpy(h + 8, &r, 2); memcpy(h + 10, &f, 2);
+  Serial.write(h, 12);
+  static uint32_t chunk[128];
+  for (uint32_t k = 0; k < n; k += 128) {
+    uint32_t m = (n - k < 128u) ? (n - k) : 128u;
+    for (uint32_t j = 0; j < m; j++) chunk[j] = IQ_BUF[k + j];
+    Serial.write((const uint8_t *)chunk, m * 4);
+  }
+}
+
+// ---- On-board FFT (command T) --------------------------------------------------
+// Fixed-point radix-2 FFT (int32 data, Q15 twiddles, 64-bit products). Hann window, optional DC removal.
+// Working memory comes from the heap (never the dump block), allocated once at boot.
+// FFT-CORE-BEGIN
+static int16_t *fftCos = nullptr, *fftSin = nullptr;   // Q15 cos / sin of 2*pi*m/FFT_MAX
+static int32_t *fftRe = nullptr, *fftIm = nullptr;
+static float *fftAcc = nullptr;                        // sum of |X|^2 / fullscale^2 over the averaged captures
+static bool fftReady = false;
+
+static bool fftInit() {
+  fftCos = (int16_t *)malloc((FFT_MAX / 2 + 1) * sizeof(int16_t));
+  fftSin = (int16_t *)malloc((FFT_MAX / 2) * sizeof(int16_t));
+  fftRe  = (int32_t *)malloc(FFT_MAX * sizeof(int32_t));
+  fftIm  = (int32_t *)malloc(FFT_MAX * sizeof(int32_t));
+  fftAcc = (float *)malloc(FFT_MAX * sizeof(float));
+  if (!fftCos || !fftSin || !fftRe || !fftIm || !fftAcc) return false;
+  for (int m = 0; m <= FFT_MAX / 2; m++) {
+    float a = 6.2831853f * (float)m / (float)FFT_MAX;
+    fftCos[m] = (int16_t)lroundf(cosf(a) * 32767.0f);
+    if (m < FFT_MAX / 2) fftSin[m] = (int16_t)lroundf(sinf(a) * 32767.0f);
+  }
+  return true;
+}
+
+// FFT of the n samples currently in IQ_BUF, added to fftAcc (bin order 0..N-1, not shifted).
+// Returns the gain index of the last sample.
+static int fftAccumulate(uint32_t N, bool dc) {
+  int log2n = 0; while ((1u << log2n) < N) log2n++;
+  const uint32_t stride = FFT_MAX / N;
+  int32_t mi = 0, mq = 0; int gain = 0;
+  if (dc) {
+    int64_t si = 0, sq = 0;
+    for (uint32_t k = 0; k < N; k++) { int i, q, g; unpack(IQ_BUF[k], i, q, g); si += i; sq += q; }
+    mi = (int32_t)(si / (int64_t)N); mq = (int32_t)(sq / (int64_t)N);
+  }
+  int64_t wsum = 0;
+  for (uint32_t k = 0; k < N; k++) {                   // window + bit-reversed load
+    int i, q; unpack(IQ_BUF[k], i, q, gain);
+    uint32_t m = k * stride;
+    int32_t c = m <= FFT_MAX / 2 ? fftCos[m] : fftCos[FFT_MAX - m];
+    int32_t w = (32767 - c) / 2;                       // Hann, Q15
+    wsum += w;
+    uint32_t r = 0;
+    for (int b = 0; b < log2n; b++) if (k & (1u << b)) r |= 1u << (log2n - 1 - b);
+    fftRe[r] = ((i - mi) * w) >> 8;                    // at most about 2^17
+    fftIm[r] = ((q - mq) * w) >> 8;
+  }
+  for (uint32_t len = 2; len <= N; len <<= 1) {        // in-place butterflies, no per-stage scaling
+    uint32_t half = len >> 1, step = FFT_MAX / len;
+    for (uint32_t i = 0; i < N; i += len)
+      for (uint32_t j = 0; j < half; j++) {
+        int32_t wr = fftCos[j * step], wi = -fftSin[j * step];
+        uint32_t u = i + j, v = u + half;
+        int32_t xr = (int32_t)(((int64_t)fftRe[v] * wr - (int64_t)fftIm[v] * wi) >> 15);
+        int32_t xi = (int32_t)(((int64_t)fftRe[v] * wi + (int64_t)fftIm[v] * wr) >> 15);
+        fftRe[v] = fftRe[u] - xr; fftIm[v] = fftIm[u] - xi;
+        fftRe[u] += xr;           fftIm[u] += xi;
+      }
+  }
+  // 0 dBFS = complex tone of amplitude 512: bin magnitude 128 * 512 * sum(window)
+  float ref = 128.0f * 512.0f * (float)wsum / 32768.0f, inv = 1.0f / (ref * ref);
+  for (uint32_t k = 0; k < N; k++) {
+    float a = (float)fftRe[k], b = (float)fftIm[k];
+    fftAcc[k] += (a * a + b * b) * inv;
+  }
+  return gain;
+}
+// FFT-CORE-END
+
+// Spectrum frame: 12-byte header { 0x00, 0xA6, 'S', 'P', u16 bins, u16 rateMsps, u16 MHz, u8 gain, u8 avg }
+// (little endian), then `bins` bytes, fft-shifted (first byte = centre - rate/2, bins/2 = centre).
+// Each byte v is a level of -v/2 dBFS (0..255 -> 0 .. -127.5 dBFS).
+static void sendSpectrum(uint32_t N, uint32_t avg, bool dc) {
+  for (uint32_t k = 0; k < N; k++) fftAcc[k] = 0.0f;
+  int gain = 0;
+  for (uint32_t a = 0; a < avg; a++) {
+    if (!sdrCapture(N, rateMsps)) { Serial.println("ERR capture"); return; }
+    gain = fftAccumulate(N, dc);
+  }
+  uint8_t h[12] = { 0, 0xA6, 'S', 'P', (uint8_t)N, (uint8_t)(N >> 8), (uint8_t)rateMsps, 0,
+                    (uint8_t)curMHz, (uint8_t)(curMHz >> 8), (uint8_t)gain, (uint8_t)avg };
+  static uint8_t out[FFT_MAX];
+  for (uint32_t k = 0; k < N; k++) {
+    float p = fftAcc[(k + N / 2) % N] / (float)avg;
+    long v = lroundf(-20.0f * log10f(p + 1e-12f));
+    out[k] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+  }
+  Serial.write(h, 12);
+  Serial.write(out, N);
+}
+
 static void handleLine(char *line) {
-  unsigned a, b, c; char x;
+  unsigned a, b, c; char x; int n;
   if (sscanf(line, "F %u %c", &a, &x) == 1) {
     Serial.println(sdrTune(a) ? "OK" : "ERR range");
   } else if (sscanf(line, "B %u %c", &a, &x) == 1) {
@@ -305,6 +418,14 @@ static void handleLine(char *line) {
       report(f, 1024);
     }
     sdrTune(curMHz);
+  } else if (sscanf(line, "D %u %c", &a, &x) == 1 && a >= 1 && a <= MAX_WORDS) {
+    if (sdrCapture(a, rateMsps)) sendIq(a); else Serial.println("ERR capture");
+  } else if ((n = sscanf(line, "T %u %u %u %c", &a, &b, &c, &x)) == 2 || n == 3) {
+    if (!fftReady) Serial.println("ERR fft memory");
+    else if (a < 64 || a > FFT_MAX || (a & (a - 1)) || b < 1 || b > 32) Serial.printf("ERR size 64..%d (power of 2), avg 1..32\n", FFT_MAX);
+    else sendSpectrum(a, b, n == 2 || c != 0);
+  } else if (sscanf(line, "M %u %c", &a, &x) == 1 && a <= 1) {
+    streaming = (a == 1); Serial.println("OK");
   } else {
     Serial.println("ERR command");
   }
@@ -338,7 +459,9 @@ void c3iqSetup() {
   delay(20);
   sdrTune(curMHz);
   Serial.println(force_rx_gain ? "gain: PHY force_rx_gain" : "gain: register fallback (unverified)");
-  Serial.println("ready: F/B/R/N/S/G commands");
+  fftReady = fftInit();
+  Serial.println(fftReady ? "fft: ready" : "fft: out of memory, T disabled");
+  Serial.println("ready: F/B/R/N/S/G/D/M/T commands");
 }
 
 void c3iqLoop() {
@@ -349,6 +472,6 @@ void c3iqLoop() {
     else if (len < sizeof(line) - 1) line[len++] = ch;
   }
   if (!sdrSafe) { delay(500); return; }
-  report(curMHz, nSamples);
+  if (streaming) report(curMHz, nSamples);
   delay(200);
 }
