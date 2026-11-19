@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32-C3 RF Scanner</title>
+<style>
+:root{--bg:#10141a;--panel:#171d26;--line:#2a3340;--fg:#e6ebf2;--mut:#8a97a8;--acc:#3ddc97;--warn:#ffb454;
+  --f:system-ui,-apple-system,"Segoe UI",sans-serif}
+@media (prefers-color-scheme:light){:root{--bg:#eef1f5;--panel:#fff;--line:#d3dae3;--fg:#17202b;--mut:#5d6b7c;--acc:#0a9b62;--warn:#b86e00}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 var(--f)}
+header{display:flex;gap:12px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:16px;margin:0;flex:1}
+main{display:grid;grid-template-columns:280px 1fr;gap:12px;padding:12px;max-width:1300px;margin:auto}
+@media(max-width:800px){main{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:12px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:0 0 8px}
+label{display:block;font-size:12px;color:var(--mut);margin:8px 0 2px}
+input,select,button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;width:100%}
+button{cursor:pointer;width:auto}button:hover{border-color:var(--acc)}
+button.pri{background:var(--acc);color:#04130c;border-color:var(--acc);font-weight:600}
+button:disabled{opacity:.4;cursor:default}
+.row{display:flex;gap:8px;align-items:center}.row>*{flex:1}.row>button{flex:none}
+.tabs button{border-radius:6px 6px 0 0}.tabs button.on{border-color:var(--acc);color:var(--acc)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.card b{display:block;font-size:20px;font-variant-numeric:tabular-nums}.card span{font-size:11px;color:var(--mut)}
+canvas{width:100%;display:block;background:var(--panel);border:1px solid var(--line);border-radius:8px}
+#wf{image-rendering:pixelated;margin-top:8px;height:150px}
+#log{height:90px;overflow:auto;font:11px/1.4 ui-monospace,Menlo,Consolas,monospace;color:var(--mut);white-space:pre-wrap}
+#st{font-size:12px;color:var(--mut)}#st.ok{color:var(--acc)}#warn{color:var(--warn);font-size:12px;min-height:16px;margin-top:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1>ESP32-C3 RF Scanner</h1>
+  <span id="st">Not connected</span>
+  <button id="bConn" class="pri">Connect (USB)</button>
+  <button id="bDemo">Demo</button>
+</header>
+<main>
+<aside>
+  <div class="panel"><h2>Receiver</h2>
+    <label>Frequency (MHz)</label><input id="fc" type="number" value="2437" min="100" max="6000">
+    <label>Bandwidth (MHz, 0 = auto)</label><input id="bw" type="number" value="0" min="0" max="62">
+    <div class="row"><div><label>Sample rate</label><select id="sr"><option>80</option><option>40</option><option>16</option></select></div>
+    <div><label>Samples</label><input id="ns" type="number" value="4096" min="1" max="16380"></div></div>
+    <label>Gain</label>
+    <div class="row"><select id="gm"><option value="auto">Hardware AGC</option><option value="man">Manual index</option></select>
+    <input id="gi" type="number" value="40" min="0" max="79" disabled></div>
+    <div style="margin-top:10px"><button id="bApply" class="pri" disabled>Apply settings</button></div>
+  </div>
+  <div class="panel"><h2>Sweep</h2>
+    <div class="row"><div><label>From</label><input id="sf" type="number" value="2400"></div>
+    <div><label>To</label><input id="st2" type="number" value="2500"></div>
+    <div><label>Step</label><input id="ss" type="number" value="1" min="1"></div></div>
+    <label>Preset</label>
+    <select id="pre"><option value="2400,2500,1">Wi-Fi 2.4 GHz (2400-2500)</option><option value="2200,2700,5">Wide 2.2-2.7 GHz</option>
+    <option value="1850,2200,5">Alt. LO 1.85-2.2 GHz</option></select>
+    <div class="row" style="margin-top:10px"><button id="bOnce" disabled>Sweep once</button><button id="bRun" class="pri" disabled>Start</button></div>
+    <label><input id="pk" type="checkbox" checked style="width:auto"> Peak hold</label>
+    <div id="warn"></div>
+  </div>
+  <div class="panel"><h2>Device log</h2><div id="log"></div></div>
+</aside>
+<section>
+  <div class="tabs"><button id="tSweep" class="on">Sweep</button><button id="tMon">Monitor</button></div>
+  <div class="cards" style="margin-top:8px">
+    <div class="card"><b id="c1">-</b><span id="l1">Level (dBFS)</span></div>
+    <div class="card"><b id="c2">-</b><span id="l2">Strongest (MHz)</span></div>
+    <div class="card"><b id="c3">-</b><span>RMS / peak (counts)</span></div>
+    <div class="card"><b id="c4">-</b><span>DC I / Q</span></div>
+    <div class="card"><b id="c5">-</b><span>Gain index</span></div>
+  </div>
+  <canvas id="sp" height="320"></canvas>
+  <canvas id="wf" height="120"></canvas>
+  <div id="hover" style="font-size:12px;color:var(--mut);margin-top:6px;min-height:18px"></div>
+</section>
+</main>
+<script src="c3iq.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const YMIN = -80, YMAX = 0, HIST = 300;
+let dev = null, mode = 'sweep', running = false, pts = [], peak = [], hist = [], gMax = 79;
+
+const log = s => { const l = $('log'); l.textContent += s + '\n'; l.scrollTop = 1e9; };
+const status = (t, ok) => { $('st').textContent = t; $('st').className = ok ? 'ok' : ''; };
+const en = on => ['bApply', 'bOnce', 'bRun'].forEach(i => $(i).disabled = !on);
+const col = css => getComputedStyle(document.documentElement).getPropertyValue(css).trim();
+
+async function connect(demo) {
+  try {
+    status('Connecting...');
+    dev = await (demo ? C3IQ.connectDemo() : C3IQ.connectSerial());
+    dev.on('line', e => log(e.detail)).on('reading', e => onStream(e.detail)).on('close', () => {
+      running = false; en(false); status('Disconnected'); $('bRun').textContent = 'Start'; });
+    en(true); status(demo ? 'Demo mode (simulated)' : 'Connected', true);
+    await applySettings();
+  } catch (e) { status('Error: ' + e.message); log(String(e)); }
+}
+
+async function applySettings() {
+  try {
+    await dev.tune($('fc').value);
+    await dev.bandwidth($('bw').value);
+    await dev.sampleRate($('sr').value);
+    await dev.samples($('ns').value);
+    const g = await dev.gainInfo();
+    if (g) { gMax = g.max; $('gi').max = g.max; }
+    await dev.gain($('gm').value === 'auto' ? 'auto' : Math.min($('gi').value, gMax));
+    log('settings applied');
+  } catch (e) { status('Error: ' + e.message); log(String(e)); }
+}
+
+function checkRange() {
+  const a = +$('sf').value, b = +$('st2').value, lo = Math.max(a, 1842), hi = Math.min(b, 2700);
+  $('warn').textContent = (a < 1842 || b > 2700 || (a < 2210 && b > 2210 && false))
+    ? 'The PLL is only expected to lock at about 1.84-2.7 GHz; readings outside that are unreliable.' : '';
+}
+
+async function sweepOnce() {
+  checkRange();
+  try {
+    pts = await dev.scan($('sf').value, $('st2').value, $('ss').value);
+    const ok = pts.filter(p => !p.failed);
+    if (!peak.length || peak.length !== pts.length || peak[0].mhz !== pts[0].mhz) peak = pts.map(p => ({ mhz: p.mhz, dbfs: YMIN }));
+    ok.forEach(p => { const k = pts.indexOf(p); if (p.dbfs > peak[k].dbfs) peak[k].dbfs = p.dbfs; });
+    if (ok.length) { const m = ok.reduce((a, b) => b.dbfs > a.dbfs ? b : a);
+      show(m.dbfs.toFixed(1), m.mhz, m.rms, m.peak, m.dcI, m.dcQ, m.gain); }
+    drawWf(); drawSpectrum();
+  } catch (e) { running = false; $('bRun').textContent = 'Start'; log(String(e)); }
+}
+async function sweepLoop() {
+  while (running && dev && dev.connected) { await sweepOnce(); await new Promise(r => setTimeout(r, 20)); }
+}
+
+function show(db, mhz, rms, pk, dI, dQ, g) {
+  $('c1').textContent = db; $('c2').textContent = mhz;
+  $('c3').textContent = `${(+rms).toFixed(0)} / ${pk}`; $('c4').textContent = `${(+dI).toFixed(1)} / ${(+dQ).toFixed(1)}`; $('c5').textContent = g;
+}
+function onStream(r) {
+  if (mode !== 'monitor' || r.failed) return;
+  hist.push(r.dbfs); if (hist.length > HIST) hist.shift();
+  show(r.dbfs.toFixed(1), r.mhz, r.rms, r.peak, r.dcI, r.dcQ, r.gain);
+  drawSpectrum();
+}
+
+// ---- drawing ----
+function fit(c) { const w = c.clientWidth, h = c.clientHeight || +c.getAttribute('height'), d = devicePixelRatio || 1;
+  if (c.width !== w * d) { c.width = w * d; c.height = h * d; } const x = c.getContext('2d'); x.setTransform(d, 0, 0, d, 0, 0); return [x, w, h]; }
+const M = { l: 44, r: 10, t: 10, b: 22 };
+
+function drawSpectrum() {
+  const [x, W, H] = fit($('sp')), pw = W - M.l - M.r, ph = H - M.t - M.b;
+  x.clearRect(0, 0, W, H);
+  const yv = v => M.t + ph * (1 - (Math.max(YMIN, Math.min(YMAX, v)) - YMIN) / (YMAX - YMIN));
+  x.font = '11px system-ui'; x.fillStyle = col('--mut'); x.strokeStyle = col('--line'); x.lineWidth = 1;
+  for (let v = YMIN; v <= YMAX; v += 10) { x.beginPath(); x.moveTo(M.l, yv(v)); x.lineTo(W - M.r, yv(v)); x.stroke(); x.fillText(v, 8, yv(v) + 4); }
+  const sweep = mode === 'sweep';
+  const n = sweep ? pts.length : hist.length;
+  if (n < 2) { x.fillText(sweep ? 'Press Start or Sweep once' : 'Waiting for readings...', M.l + 10, M.t + 20); return; }
+  const f0 = sweep ? pts[0].mhz : 0, f1 = sweep ? pts[n - 1].mhz : HIST - 1;
+  const xv = f => M.l + pw * (f - f0) / (f1 - f0 || 1);
+  if (sweep) {                                   // axis labels + Wi-Fi channel markers
+    const stepL = (f1 - f0) > 200 ? 50 : 10;
+    for (let f = Math.ceil(f0 / stepL) * stepL; f <= f1; f += stepL) x.fillText(f, xv(f) - 12, H - 6);
+    x.setLineDash([2, 4]);
+    for (let c = 1; c <= 14; c++) { const f = c === 14 ? 2484 : 2407 + 5 * c;
+      if (f > f0 && f < f1) { x.beginPath(); x.moveTo(xv(f), M.t); x.lineTo(xv(f), M.t + ph); x.stroke(); x.fillText('ch' + c, xv(f) - 8, M.t + 10); } }
+    x.setLineDash([]);
+  }
+  const line = (arr, key, color) => { x.beginPath(); let go = false;
+    arr.forEach((p, i) => { const v = key ? p[key] : p; if (p.failed) { go = false; return; }
+      const X = xv(sweep ? p.mhz : i), Y = yv(v); go ? x.lineTo(X, Y) : x.moveTo(X, Y); go = true; });
+    x.strokeStyle = color; x.lineWidth = 1.5; x.stroke(); };
+  if (sweep && $('pk').checked) line(peak, 'dbfs', col('--warn'));
+  line(sweep ? pts : hist, sweep ? 'dbfs' : null, col('--acc'));
+}
+
+function drawWf() {
+  const c = $('wf'), n = pts.length; if (n < 2) return;
+  if (c.width !== n) { c.width = n; c.height = 120; }
+  const x = c.getContext('2d'); x.drawImage(c, 0, 1);
+  pts.forEach((p, i) => { const t = p.failed ? 0 : Math.max(0, Math.min(1, (p.dbfs - YMIN) / (YMAX - YMIN)));
+    x.fillStyle = `hsl(${240 - 240 * t},100%,${12 + 45 * t}%)`; x.fillRect(i, 0, 1, 1); });
+  c.style.marginLeft = M.l + 'px'; c.style.width = `calc(100% - ${M.l + M.r}px)`;
+}
+
+// ---- wiring ----
+$('bConn').onclick = () => connect(false);
+$('bDemo').onclick = () => connect(true);
+$('bApply').onclick = applySettings;
+$('bOnce').onclick = sweepOnce;
+$('bRun').onclick = () => { running = !running; $('bRun').textContent = running ? 'Stop' : 'Start'; if (running) sweepLoop(); };
+$('gm').onchange = () => $('gi').disabled = $('gm').value === 'auto';
+$('pre').onchange = () => { [$('sf').value, $('st2').value, $('ss').value] = $('pre').value.split(','); peak = []; checkRange(); };
+['sf', 'st2', 'ss'].forEach(i => $(i).onchange = () => { peak = []; checkRange(); });
+const setMode = m => { mode = m; $('tSweep').className = m === 'sweep' ? 'on' : ''; $('tMon').className = m === 'monitor' ? 'on' : '';
+  $('wf').style.display = m === 'sweep' ? '' : 'none'; $('l1').textContent = m === 'sweep' ? 'Level (dBFS)' : 'Level (dBFS)';
+  $('l2').textContent = m === 'sweep' ? 'Strongest (MHz)' : 'Frequency (MHz)';
+  if (m === 'monitor' && running) { running = false; $('bRun').textContent = 'Start'; } drawSpectrum(); };
+$('tSweep').onclick = () => setMode('sweep'); $('tMon').onclick = () => setMode('monitor');
+$('sp').onmousemove = e => { if (mode !== 'sweep' || pts.length < 2) return;
+  const r = e.target.getBoundingClientRect(), t = (e.clientX - r.left - M.l) / (r.width - M.l - M.r),
+  p = pts[Math.max(0, Math.min(pts.length - 1, Math.round(t * (pts.length - 1))))];
+  $('hover').textContent = p.failed ? `${p.mhz} MHz: capture failed` : `${p.mhz} MHz: ${p.dbfs.toFixed(1)} dBFS (gain ${p.gain})`; };
+addEventListener('resize', drawSpectrum);
+if (!navigator.serial) { status('Web Serial unavailable: use Chrome or Edge (Demo still works)'); }
+drawSpectrum();
+</script>
+</body>
+</html>
