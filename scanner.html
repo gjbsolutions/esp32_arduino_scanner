@@ -62,10 +62,17 @@ canvas{width:100%;display:block;background:var(--panel);border:1px solid var(--l
     <label><input id="pk" type="checkbox" checked style="width:auto"> Peak hold</label>
     <div id="warn"></div>
   </div>
+  <div class="panel"><h2>FFT (on board)</h2>
+    <div class="row"><div><label>FFT size</label><select id="fs"><option>128</option><option>256</option><option>512</option><option selected>1024</option><option>2048</option></select></div>
+    <div><label>Averages (on board)</label><select id="fa"><option>1</option><option selected>4</option><option>8</option><option>16</option></select></div></div>
+    <label><input id="fd" type="checkbox" checked style="width:auto"> Remove DC</label>
+    <div style="margin-top:10px"><button id="bFft" class="pri" disabled>Start FFT</button></div>
+    <div style="font-size:11px;color:var(--mut);margin-top:6px">The board computes the FFT (firmware T command) and sends only the bins. Span = sample rate, centred on the frequency.</div>
+  </div>
   <div class="panel"><h2>Device log</h2><div id="log"></div></div>
 </aside>
 <section>
-  <div class="tabs"><button id="tSweep" class="on">Sweep</button><button id="tMon">Monitor</button></div>
+  <div class="tabs"><button id="tSweep" class="on">Sweep</button><button id="tFft">FFT</button><button id="tMon">Monitor</button></div>
   <div class="cards" style="margin-top:8px">
     <div class="card"><b id="c1">-</b><span id="l1">Level (dBFS)</span></div>
     <div class="card"><b id="c2">-</b><span id="l2">Strongest (MHz)</span></div>
@@ -82,11 +89,11 @@ canvas{width:100%;display:block;background:var(--panel);border:1px solid var(--l
 <script>
 const $ = id => document.getElementById(id);
 const YMIN = -80, YMAX = 0, HIST = 300;
-let dev = null, mode = 'sweep', running = false, pts = [], peak = [], hist = [], gMax = 79;
+let dev = null, mode = 'sweep', running = false, fftRun = false, fftPts = [], fftAcc = null, pts = [], peak = [], hist = [], gMax = 79;
 
 const log = s => { const l = $('log'); l.textContent += s + '\n'; l.scrollTop = 1e9; };
 const status = (t, ok) => { $('st').textContent = t; $('st').className = ok ? 'ok' : ''; };
-const en = on => ['bApply', 'bOnce', 'bRun'].forEach(i => $(i).disabled = !on);
+const en = on => ['bApply', 'bOnce', 'bRun', 'bFft'].forEach(i => $(i).disabled = !on);
 const col = css => getComputedStyle(document.documentElement).getPropertyValue(css).trim();
 
 async function connect(demo) {
@@ -94,9 +101,10 @@ async function connect(demo) {
     status('Connecting...');
     dev = await (demo ? C3IQ.connectDemo() : C3IQ.connectSerial());
     dev.on('line', e => log(e.detail)).on('reading', e => onStream(e.detail)).on('close', () => {
-      running = false; en(false); status('Disconnected'); $('bRun').textContent = 'Start'; });
+      running = fftRun = false; en(false); status('Disconnected'); $('bRun').textContent = 'Start'; });
     en(true); status(demo ? 'Demo mode (simulated)' : 'Connected', true);
     await applySettings();
+    dev.stream(mode === 'monitor').catch(log);
   } catch (e) { status('Error: ' + e.message); log(String(e)); }
 }
 
@@ -128,8 +136,22 @@ async function sweepOnce() {
     ok.forEach(p => { const k = pts.indexOf(p); if (p.dbfs > peak[k].dbfs) peak[k].dbfs = p.dbfs; });
     if (ok.length) { const m = ok.reduce((a, b) => b.dbfs > a.dbfs ? b : a);
       show(m.dbfs.toFixed(1), m.mhz, m.rms, m.peak, m.dcI, m.dcQ, m.gain); }
-    drawWf(); drawSpectrum();
+    drawWf(pts); drawSpectrum();
   } catch (e) { running = false; $('bRun').textContent = 'Start'; log(String(e)); }
+}
+async function fftLoop() {
+  while (fftRun && dev && dev.connected) {
+    try {
+      const s = await dev.spectrum($('fs').value, $('fa').value, $('fd').checked);
+      fftPts = Array.from(s.freqs, (f, j) => ({ mhz: +f.toFixed(3), dbfs: s.db[j] }));
+      if (peak.length !== s.N || peak[0].mhz !== fftPts[0].mhz) peak = fftPts.map(p => ({ mhz: p.mhz, dbfs: YMIN }));
+      fftPts.forEach((p, j) => { if (p.dbfs > peak[j].dbfs) peak[j].dbfs = p.dbfs; });
+      const m = fftPts.reduce((a, b) => b.dbfs > a.dbfs ? b : a);
+      $('c1').textContent = m.dbfs.toFixed(1); $('c2').textContent = m.mhz.toFixed(2);
+      $('c3').textContent = '-'; $('c4').textContent = '-'; $('c5').textContent = s.gain;
+      drawWf(fftPts); drawSpectrum();
+    } catch (e) { fftRun = false; $('bFft').textContent = 'Start FFT'; log(String(e) + ' (is the T-command firmware flashed?)'); }
+  }
 }
 async function sweepLoop() {
   while (running && dev && dev.connected) { await sweepOnce(); await new Promise(r => setTimeout(r, 20)); }
@@ -157,13 +179,13 @@ function drawSpectrum() {
   const yv = v => M.t + ph * (1 - (Math.max(YMIN, Math.min(YMAX, v)) - YMIN) / (YMAX - YMIN));
   x.font = '11px system-ui'; x.fillStyle = col('--mut'); x.strokeStyle = col('--line'); x.lineWidth = 1;
   for (let v = YMIN; v <= YMAX; v += 10) { x.beginPath(); x.moveTo(M.l, yv(v)); x.lineTo(W - M.r, yv(v)); x.stroke(); x.fillText(v, 8, yv(v) + 4); }
-  const sweep = mode === 'sweep';
-  const n = sweep ? pts.length : hist.length;
-  if (n < 2) { x.fillText(sweep ? 'Press Start or Sweep once' : 'Waiting for readings...', M.l + 10, M.t + 20); return; }
-  const f0 = sweep ? pts[0].mhz : 0, f1 = sweep ? pts[n - 1].mhz : HIST - 1;
+  const sweep = mode !== 'monitor', data = mode === 'fft' ? fftPts : pts;
+  const n = sweep ? data.length : hist.length;
+  if (n < 2) { x.fillText(mode === 'fft' ? 'Press Start FFT' : sweep ? 'Press Start or Sweep once' : 'Waiting for readings...', M.l + 10, M.t + 20); return; }
+  const f0 = sweep ? data[0].mhz : 0, f1 = sweep ? data[n - 1].mhz : HIST - 1;
   const xv = f => M.l + pw * (f - f0) / (f1 - f0 || 1);
   if (sweep) {                                   // axis labels + Wi-Fi channel markers
-    const stepL = (f1 - f0) > 200 ? 50 : 10;
+    const sp = f1 - f0, stepL = sp > 200 ? 50 : sp > 60 ? 10 : sp > 20 ? 5 : 2;
     for (let f = Math.ceil(f0 / stepL) * stepL; f <= f1; f += stepL) x.fillText(f, xv(f) - 12, H - 6);
     x.setLineDash([2, 4]);
     for (let c = 1; c <= 14; c++) { const f = c === 14 ? 2484 : 2407 + 5 * c;
@@ -175,14 +197,14 @@ function drawSpectrum() {
       const X = xv(sweep ? p.mhz : i), Y = yv(v); go ? x.lineTo(X, Y) : x.moveTo(X, Y); go = true; });
     x.strokeStyle = color; x.lineWidth = 1.5; x.stroke(); };
   if (sweep && $('pk').checked) line(peak, 'dbfs', col('--warn'));
-  line(sweep ? pts : hist, sweep ? 'dbfs' : null, col('--acc'));
+  line(sweep ? data : hist, sweep ? 'dbfs' : null, col('--acc'));
 }
 
-function drawWf() {
-  const c = $('wf'), n = pts.length; if (n < 2) return;
+function drawWf(a) {
+  const c = $('wf'), n = a.length; if (n < 2) return;
   if (c.width !== n) { c.width = n; c.height = 120; }
   const x = c.getContext('2d'); x.drawImage(c, 0, 1);
-  pts.forEach((p, i) => { const t = p.failed ? 0 : Math.max(0, Math.min(1, (p.dbfs - YMIN) / (YMAX - YMIN)));
+  a.forEach((p, i) => { const t = p.failed ? 0 : Math.max(0, Math.min(1, (p.dbfs - YMIN) / (YMAX - YMIN)));
     x.fillStyle = `hsl(${240 - 240 * t},100%,${12 + 45 * t}%)`; x.fillRect(i, 0, 1, 1); });
   c.style.marginLeft = M.l + 'px'; c.style.width = `calc(100% - ${M.l + M.r}px)`;
 }
@@ -192,18 +214,22 @@ $('bConn').onclick = () => connect(false);
 $('bDemo').onclick = () => connect(true);
 $('bApply').onclick = applySettings;
 $('bOnce').onclick = sweepOnce;
+$('bFft').onclick = () => { fftRun = !fftRun; $('bFft').textContent = fftRun ? 'Stop' : 'Start FFT'; if (fftRun) fftLoop(); };
 $('bRun').onclick = () => { running = !running; $('bRun').textContent = running ? 'Stop' : 'Start'; if (running) sweepLoop(); };
 $('gm').onchange = () => $('gi').disabled = $('gm').value === 'auto';
 $('pre').onchange = () => { [$('sf').value, $('st2').value, $('ss').value] = $('pre').value.split(','); peak = []; checkRange(); };
 ['sf', 'st2', 'ss'].forEach(i => $(i).onchange = () => { peak = []; checkRange(); });
-const setMode = m => { mode = m; $('tSweep').className = m === 'sweep' ? 'on' : ''; $('tMon').className = m === 'monitor' ? 'on' : '';
-  $('wf').style.display = m === 'sweep' ? '' : 'none'; $('l1').textContent = m === 'sweep' ? 'Level (dBFS)' : 'Level (dBFS)';
-  $('l2').textContent = m === 'sweep' ? 'Strongest (MHz)' : 'Frequency (MHz)';
-  if (m === 'monitor' && running) { running = false; $('bRun').textContent = 'Start'; } drawSpectrum(); };
-$('tSweep').onclick = () => setMode('sweep'); $('tMon').onclick = () => setMode('monitor');
-$('sp').onmousemove = e => { if (mode !== 'sweep' || pts.length < 2) return;
+const setMode = m => { mode = m; running = fftRun = false; peak = [];
+  $('bRun').textContent = 'Start'; $('bFft').textContent = 'Start FFT';
+  [['tSweep', 'sweep'], ['tFft', 'fft'], ['tMon', 'monitor']].forEach(([i, k]) => $(i).className = m === k ? 'on' : '');
+  $('wf').style.display = m === 'monitor' ? 'none' : '';
+  $('l2').textContent = m === 'sweep' ? 'Strongest (MHz)' : m === 'fft' ? 'Strongest bin (MHz)' : 'Frequency (MHz)';
+  if (dev && dev.connected) dev.stream(m === 'monitor').catch(log);
+  drawSpectrum(); };
+$('tSweep').onclick = () => setMode('sweep'); $('tFft').onclick = () => setMode('fft'); $('tMon').onclick = () => setMode('monitor');
+$('sp').onmousemove = e => { const D = mode === 'fft' ? fftPts : pts; if (mode === 'monitor' || D.length < 2) return;
   const r = e.target.getBoundingClientRect(), t = (e.clientX - r.left - M.l) / (r.width - M.l - M.r),
-  p = pts[Math.max(0, Math.min(pts.length - 1, Math.round(t * (pts.length - 1))))];
+  p = D[Math.max(0, Math.min(D.length - 1, Math.round(t * (D.length - 1))))];
   $('hover').textContent = p.failed ? `${p.mhz} MHz: capture failed` : `${p.mhz} MHz: ${p.dbfs.toFixed(1)} dBFS (gain ${p.gain})`; };
 addEventListener('resize', drawSpectrum);
 if (!navigator.serial) { status('Web Serial unavailable: use Chrome or Edge (Demo still works)'); }
