@@ -92,6 +92,9 @@ Type a command and press Enter. Capture settings apply to every reading until ch
 | `G <index>` | Manual gain index, from 0 up to the maximum shown by `G ?`. Higher means more gain. |
 | `G ?` | Show gain mode, current index, highest valid index, and whether the force flag is set. |
 | `S <from> <to> <step>` | Power scan. Tunes each frequency, takes 1024 samples, prints one line per step, then returns to the current frequency. |
+| `D <samples>` | Capture 1-16380 samples and send them as one binary frame (12-byte header, then the raw 32-bit words). Raw dump for your own processing (see `C3IQ.fft`). Replies `ERR capture` on failure; no `OK` after a frame. |
+| `T <size> <avg> [dc]` | On-board FFT: `size` 64-`FFT_MAX` (power of two, default max 2048), `avg` 1-32 captures averaged in power, `dc` 1 (default) removes DC. Replies with one binary spectrum frame: a 12-byte header, then one byte per bin (fft-shifted; byte `v` is `-v/2` dBFS). Replies `ERR ...` on bad arguments or a failed capture. |
+| `M <0\|1>` | Pause (`0`) or resume (`1`) the periodic text readings. |
 
 Examples:
 
@@ -113,7 +116,7 @@ Edit `blockStats()` or add your own function in `c3_iq_core.cpp`. After a succes
 
 ## Web scanner
 
-`web/` contains a browser front end for the sketch. It needs **no firmware changes**: it opens the serial port with the Web Serial API, sends the commands from [Commands](#commands) and parses the text readings the sketch already prints.
+`web/` contains a browser front end for the sketch. It opens the serial port with the Web Serial API and sends the commands from [Commands](#commands). The Sweep and Monitor tabs work with the original sketch (they parse the text readings it prints); the FFT tab needs the updated `c3_iq_core.cpp` with the `D`, `M` and `T` commands.
 
 | File | Purpose |
 |---|---|
@@ -135,6 +138,7 @@ Click **Demo** instead to try the interface with a simulated board and no hardwa
 
 - **Receiver:** frequency, bandwidth (0 = automatic), sample rate (80, 40 or 16 MS/s), samples per capture, and hardware AGC or a manual gain index. The manual gain limit is read from the board with `G ?` after tuning. **Apply settings** sends them in order: `F`, `B`, `R`, `N`, `G`.
 - **Sweep tab:** runs the `S` command repeatedly and plots power in dBFS against frequency, with optional peak hold, Wi-Fi channel markers, a waterfall (newest sweep on top) and a hover readout. Presets cover the 2.4 GHz band, 2.2-2.7 GHz and 1.85-2.2 GHz. **Sweep once** runs a single pass.
+- **FFT tab:** the board captures, removes DC, applies a Hann window and runs the FFT (command `T`), averaging 1-32 captures; the browser only plots the returned bins (dBFS, 0 dBFS = full-scale complex tone) across the sample rate centred on the tuned frequency, with peak hold and a waterfall. FFT sizes 128-2048. Needs the updated `c3_iq_core.cpp`.
 - **Monitor tab:** plots the level at the tuned frequency over time, with cards for RMS, peak, DC I/Q and the gain index.
 - **Device log:** every raw line from the board.
 
@@ -169,19 +173,24 @@ The sweep panel warns when the range goes outside roughly 1.84-2.7 GHz, where th
 | `dev.samples(n)` | `N` | 1-16380. |
 | `dev.gain('auto' \| index)` | `G H` / `G <index>` | |
 | `dev.gainInfo()` | `G ?` | `{mode, index, max, latched}`. Tune first; `max` is only known then. |
+| `dev.stream(on)` | `M` | Pause or resume the periodic text readings. |
+| `dev.iq(n)` | `D` | One raw capture: `{mhz, rate, n, gain, i, q}` with `i` and `q` as `Float32Array`s in ADC counts. |
+| `dev.spectrum(size, avg, dc)` | `T` | On-board FFT: `{center, rate, N, gain, avg, binMHz, freqs, db}` with `freqs` in MHz and `db` in dBFS. |
+| `C3IQ.fft(iq, {size, dc})` | | Hann-windowed FFT in the browser: `{mhz, db, N, binMHz}`, fft-shifted. `size` is rounded down to a power of two. |
 | `dev.scan(from, to, step)` | `S` | Resolves with one reading per step (1024 samples each). |
 | `dev.close()` | | Closes the port. |
 
 Arguments are range-checked before anything is sent, and a firmware `ERR ...` reply rejects the promise. Commands are queued, so they can be issued back to back.
 
-Events (`dev.on(name, fn)`, payload in `e.detail`): `reading` (streaming reading at the tuned frequency), `scanpoint` (each point during a sweep), `line` (raw text), `ready`, and `close`.
+Events (`dev.on(name, fn)`, payload in `e.detail`): `reading` (streaming reading at the tuned frequency), `scanpoint` (each point during a sweep), `iq` (each raw capture), `spectrum` (each on-board FFT), `line` (raw text), `ready`, and `close`.
 
 A reading looks like `{ mhz, rms, dbfs, dcI, dcQ, peak, gainMode, gain, failed, t }`. `failed: true` (with only `mhz` and `t`) marks a `capture failed` line. `C3IQ.parseReading(line)` is exposed for your own use.
 
 ### Web scanner notes
 
 - **Text protocol.** The driver parses the sketch's `report()` output. If you change that print format, update the regular expression at the top of `c3iq.js`.
-- **Power only.** You get RMS, peak, DC and gain per capture, not raw samples. Sending raw I/Q to the browser would need a firmware change (a binary dump command and a faster baud rate): a full 16,380-word capture is about 65 KB, which takes several seconds at 115200 baud.
+- **On-board FFT.** The FFT is a fixed-point radix-2 transform (int32 data, Q15 twiddles) with about 14 bytes of heap per bin (roughly 29 KB at the default `FFT_MAX` of 2048; raise it to 4096 in `c3_iq_core.cpp` if you have the heap). The memory is allocated once at boot from the heap, never the dump block; the boot output says `fft: ready` or `fft: out of memory, T disabled`. Only one byte per bin is sent (0.5 dB steps, 0 to -127.5 dBFS), so a 1024-bin frame is about 1 KB, roughly 0.1 s at 115200 baud, and much faster over native USB. `D` and `C3IQ.fft` remain for doing the FFT in the browser on raw samples (4 bytes per sample).
+- **FFT caveats.** The span equals the sample rate, but the analog filter is at most 62 MHz wide, so the outer edges roll off at 80 MS/s. There is no per-frequency DC recalibration (see [Limitations](#limitations)); keep **Remove DC** on. Levels are relative to full scale at whatever gain was in effect. The frequency orientation depends on the sign convention in `unpack()` and is unverified.
 - **Streaming and sweeps share the port.** While a sweep runs, the driver matches incoming lines to the expected frequencies in order. A streaming line from just before the sweep could, rarely, be mistaken for the first point if it is at the same frequency.
 - **dBFS is not calibrated.** Levels are relative to ADC full scale at whatever gain the AGC (or your manual index) chose. Gain indexes are not dB, so levels are not comparable across gain settings.
 - **Untested.** The web scanner has not yet been run against real hardware by the author. Please report results.
@@ -204,7 +213,7 @@ Nothing in this project writes flash contents, the bootloader or eFuses. Capture
 
 Verified by the author on a plain ESP32-C3 with Arduino-ESP32 3.3.10: build, upload, boot checks pass, capture works, and **reception is confirmed** (live readings at 2437 MHz with hardware AGC).
 
-Not yet independently verified: manual gain latching when the register fallback is used, tuning to frequencies that are not Wi-Fi channels, the bandwidth setting, and the `S` scan across a busy channel. Please report results.
+Not yet independently verified: the `D`/`M`/`T` commands, the on-board FFT and the FFT tab, manual gain latching when the register fallback is used, tuning to frequencies that are not Wi-Fi channels, the bandwidth setting, and the `S` scan across a busy channel. Please report results.
 
 The [web scanner](#web-scanner) has not yet been verified on hardware.
 
